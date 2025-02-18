@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+"""
+Dark Theme Media Downloader
+--------------------------
+A modern dark-themed GUI application for downloading media from YouTube and Spotify.
+Features:
+- Auto-installs missing dependencies and ffmpeg
+- Spotify integration with playlist preview
+- Download progress tracking with visual feedback
+- Resume/pause functionality
+- Metadata and cover art handling
+- Dark theme throughout the interface
+"""
+
+import os
+import re
+import sys
+import subprocess
+import threading
+import logging
+import tkinter as tk
+import time
+import shutil
+import requests
+import concurrent.futures
+from mutagen.easyid3 import EasyID3
+from mutagen.id3 import ID3, APIC
+from mutagen.mp3 import MP3
+from tkinter import filedialog, messagebox, ttk
+
+# =============================================================================
+# Constants & Theme Configuration
+# =============================================================================
+COLOR_BG = "#212121"
+COLOR_SECONDARY = "#424242"
+COLOR_ACCENT = "#64B5F6"
+COLOR_TEXT = "#E0E0E0"
+COLOR_PROGRESS = "#81C784"
+COLOR_DONE = "#4CAF50"
+
+FONT_TITLE = ("Helvetica", 22, "bold")
+FONT_BODY = ("Helvetica", 12)
+FONT_SMALL = ("Helvetica", 10)
+
+STYLE_CONFIG = {
+    "TFrame": {"configure": {"background": COLOR_BG}},
+    "TLabel": {"configure": {"background": COLOR_BG, "foreground": COLOR_TEXT, "font": FONT_BODY}},
+    "TButton": {
+        "configure": {
+            "background": COLOR_ACCENT,
+            "foreground": COLOR_BG,
+            "font": FONT_BODY,
+            "padding": 8,
+            "borderwidth": 0
+        },
+        "map": {"background": [("active", "#42A5F5")]}
+    },
+    "TEntry": {
+        "configure": {
+            "fieldbackground": COLOR_SECONDARY,
+            "foreground": COLOR_TEXT,
+            "insertbackground": COLOR_TEXT,
+            "padding": 4
+        }
+    },
+    "TCombobox": {
+        "configure": {
+            "fieldbackground": COLOR_SECONDARY,
+            "foreground": COLOR_TEXT,
+            "padding": 4
+        }
+    },
+    "Horizontal.TProgressbar": {
+        "configure": {
+            "troughcolor": COLOR_SECONDARY,
+            "background": COLOR_PROGRESS,
+            "thickness": 20
+        }
+    }
+}
+
+def install_missing_dependencies() -> None:
+    """Install required Python packages and ffmpeg if missing."""
+    import importlib
+    required = {
+        "pytube": "pytube",
+        "yt_dlp": "yt-dlp",
+        "spotipy": "spotipy",
+        "mutagen": "mutagen"
+    }
+    
+    for module_name, package_name in required.items():
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            logging.info(f"Installing {package_name}...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+            except Exception as e:
+                logging.error(f"Failed to install {package_name}: {str(e)}")
+                sys.exit(1)
+    
+    if not shutil.which("ffmpeg"):
+        logging.info("Installing ffmpeg...")
+        try:
+            subprocess.check_call(["winget", "install", "ffmpeg"])
+        except Exception as e:
+            logging.error(f"Failed to install ffmpeg: {str(e)}")
+            sys.exit(1)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+install_missing_dependencies()
+
+from pytube import YouTube
+from yt_dlp import YoutubeDL
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+
+def sanitize_filename(filename: str) -> str:
+    """Remove invalid characters from filenames."""
+    return re.sub(r'[\\/*?:"<>|]', "", filename)
+
+class DownloadManager:
+    """Handles all download operations and metadata management."""
+    
+    stop_flag = False
+
+    @staticmethod
+    def reset_stop() -> None:
+        DownloadManager.stop_flag = False
+
+    @staticmethod
+    def set_stop() -> None:
+        DownloadManager.stop_flag = True
+
+    @staticmethod
+    def is_valid_youtube_url(url: str) -> bool:
+        pattern = r'(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)'
+        return bool(re.search(pattern, url))
+
+    @staticmethod
+    def _download_progress_hook(d):
+        if DownloadManager.stop_flag:
+            raise Exception("Download stopped by user.")
+        if d['status'] == 'downloading':
+            percent = d.get('_percent_str', '').strip()
+            speed = d.get('_speed_str', 'N/A')
+            eta = d.get('_eta_str', 'N/A')
+            logging.info(f"Downloading: {percent} at {speed} | ETA: {eta}")
+
+    @staticmethod
+    def download_youtube(query: str, output_path: str, is_audio: bool = True, quality: str = None) -> None:
+        try:
+            if DownloadManager.stop_flag:
+                raise Exception("Download stopped before start.")
+            
+            format_str = 'bestaudio/best' if is_audio else f'bestvideo[height<={quality or "1080"}]+bestaudio/best'
+            
+            ydl_opts = {
+                'outtmpl': os.path.join(output_path, '%(title)s.%(ext)s'),
+                'default_search': 'ytsearch',
+                'format': format_str,
+                'quiet': True,
+                'progress_hooks': [DownloadManager._download_progress_hook],
+                'continue': True
+            }
+            
+            if is_audio:
+                ydl_opts['postprocessors'] = [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }]
+
+            ffmpeg_location = os.getenv("FFMPEG_LOCATION")
+            if ffmpeg_location:
+                ydl_opts['ffmpeg_location'] = ffmpeg_location
+
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(query, download=False)
+                expected_filename = ydl.prepare_filename(info)
+                if is_audio:
+                    base, _ = os.path.splitext(expected_filename)
+                    expected_filename = f"{base}.mp3"
+                
+                if os.path.exists(expected_filename):
+                    logging.info(f"File exists, skipping: {expected_filename}")
+                    return
+                
+                ydl.download([query])
+                
+        except Exception as e:
+            logging.error(f"YouTube download failed: {str(e)}")
+            raise
+
+    @staticmethod
+    def initialize_spotify() -> spotipy.Spotify:
+        try:
+            auth_manager = SpotifyClientCredentials(
+                client_id=os.getenv("SPOTIPY_CLIENT_ID", "62c275d1bc1d44ac83c311056b42d55a"),
+                client_secret=os.getenv("SPOTIPY_CLIENT_SECRET", "1a259f3ab52b42cfa5229abaeba31fd3")
+            )
+            return spotipy.Spotify(auth_manager=auth_manager)
+        except Exception as e:
+            logging.error(f"Spotify initialization failed: {str(e)}")
+            return None
+
+    @staticmethod
+    def get_spotify_tracks(sp_client: spotipy.Spotify, url: str):
+        try:
+            if "playlist" in url:
+                playlist_id = url.split("/")[-1].split("?")[0]
+                tracks = []
+                offset = 0
+                
+                while True:
+                    results = sp_client.playlist_tracks(playlist_id, offset=offset)
+                    items = results.get("items", [])
+                    
+                    if not items:
+                        break
+                        
+                    for item in items:
+                        if track := item.get("track"):
+                            tracks.append({
+                                "name": track["name"],
+                                "artist": track["artists"][0]["name"],
+                                "album": track["album"]["name"],
+                                "cover_url": track["album"]["images"][0]["url"] if track["album"].get("images") else None
+                            })
+                            
+                    if not results.get("next"):
+                        break
+                        
+                    offset += len(items)
+                    
+                return tracks
+                
+            elif "track" in url:
+                track_id = url.split("/")[-1].split("?")[0]
+                track = sp_client.track(track_id)
+                return [{
+                    "name": track["name"],
+                    "artist": track["artists"][0]["name"],
+                    "album": track["album"]["name"],
+                    "cover_url": track["album"]["images"][0]["url"] if track["album"].get("images") else None
+                }]
+                
+            return None
+            
+        except Exception as e:
+            logging.error(f"Spotify track retrieval failed: {str(e)}")
+            return None
+
+    @staticmethod
+    def update_mp3_metadata(file_path: str, metadata: dict) -> None:
+        try:
+            try:
+                audio = EasyID3(file_path)
+            except Exception:
+                audio = MP3(file_path, ID3=ID3)
+                audio.add_tags()
+                
+            audio['title'] = metadata.get('name', '')
+            audio['artist'] = metadata.get('artist', '')
+            audio['album'] = metadata.get('album', '')
+            audio.save()
+            
+            if cover_url := metadata.get('cover_url'):
+                try:
+                    headers = {"User-Agent": "Mozilla/5.0"}
+                    r = requests.get(cover_url, headers=headers, timeout=10, stream=True)
+                    r.raise_for_status()
+                    
+                    audio = ID3(file_path)
+                    audio.delall("APIC")
+                    audio.add(APIC(
+                        encoding=3,
+                        mime='image/jpeg',
+                        type=3,
+                        desc='Cover',
+                        data=r.content
+                    ))
+                    audio.save(v2_version=3)
+                    logging.info("Updated metadata with cover art")
+                    
+                except Exception as e:
+                    logging.error(f"Failed to update cover art: {str(e)}")
+                    
+        except Exception as e:
+            logging.error(f"Failed to update metadata: {str(e)}")
+
+class DownloaderApp:
+    """Main application class handling the GUI and download coordination."""
+    
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Dark Theme Media Downloader")
+        self.root.geometry("1100x750")
+        self.root.configure(bg=COLOR_BG)
+        
+        self.style = ttk.Style()
+        self._configure_styles()
+        self._create_widgets()
+        
+        self.download_manager = DownloadManager()
+        self.stop_requested = False
+        
+        # Download state tracking
+        self.last_download_type = None
+        self.last_youtube_params = {}
+        self.last_spotify_params = {}
+        self.last_spotify_index = 0
+        
+        # Auto-preview on URL paste
+        self.spotify_url.bind("<FocusOut>", lambda event: self.preview_playlist())
+
+    def _configure_styles(self):
+        """Configure the application's visual styles."""
+        self.style.theme_use("clam")
+        for element, config in STYLE_CONFIG.items():
+            if "configure" in config:
+                self.style.configure(element, **config["configure"])
+            if "map" in config:
+                self.style.map(element, **config["map"])
+
+    def _create_widgets(self):
+        """Create and arrange all GUI elements."""
+        # Main container
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=25, pady=(25, 5))
+        
+        # Title
+        title_label = ttk.Label(main_frame, text="Media Downloader", font=FONT_TITLE)
+        title_label.pack(pady=(0, 20))
+        
+        # Navigation
+        nav_frame = ttk.Frame(main_frame)
+        nav_frame.pack(fill=tk.X, pady=(0, 20))
+        
+        self.youtube_btn = ttk.Button(nav_frame, text="YouTube", command=self.show_youtube_panel)
+        self.youtube_btn.pack(side=tk.LEFT, padx=10)
+        
+        self.spotify_btn = ttk.Button(nav_frame, text="Spotify", command=self.show_spotify_panel)
+        self.spotify_btn.pack(side=tk.LEFT, padx=10)
+        
+        self.stop_btn = ttk.Button(nav_frame, text="Stop", command=self.toggle_download)
+        self.stop_btn.pack(side=tk.RIGHT, padx=10)
+        
+        # Content area
+        content_frame = ttk.Frame(main_frame)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Panels container
+        self.panel_frame = ttk.Frame(content_frame)
+        self.panel_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        
+        # Create panels
+        self.panels = {
+            "youtube": ttk.Frame(self.panel_frame),
+            "spotify": ttk.Frame(self.panel_frame)
+        }
+        
+        self._create_youtube_panel()
+        self._create_spotify_panel()
+        
+        # Playlist section
+        self.playlist_frame = ttk.Frame(content_frame, relief=tk.GROOVE, borderwidth=2)
+        self.playlist_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        # Playlist header
+        header_frame = ttk.Frame(self.playlist_frame)
+        header_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        playlist_icon = ttk.Label(header_frame, text="🎵", font=("Helvetica", 28))
+        playlist_icon.pack(side=tk.LEFT)
+        
+        header_label = ttk.Label(header_frame, text="Playlist", font=FONT_TITLE)
+        header_label.pack(side=tk.LEFT, padx=10)
+        
+        self.playlist_percentage = ttk.Label(header_frame, text="0% downloaded", font=FONT_BODY)
+        self.playlist_percentage.pack(side=tk.RIGHT, padx=10)
+        
+        # Playlist content
+        self.playlist_listbox = tk.Listbox(
+            self.playlist_frame,
+            bg=COLOR_SECONDARY,
+            fg=COLOR_TEXT,
+            font=FONT_BODY,
+            selectbackground=COLOR_ACCENT
+        )
+        self.playlist_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Show YouTube panel by default
+        self.show_youtube_panel()
+
+    def _create_youtube_panel(self):
+        """Create the YouTube download panel."""
+        panel = self.panels["youtube"]
+        
+        # Clear existing widgets
+        for widget in panel.winfo_children():
+            widget.destroy()
+            
+        panel.pack(fill=tk.BOTH, expand=True)
+        
+        # URL input
+        ttk.Label(panel, text="YouTube URL:").grid(row=0, column=0, sticky=tk.W, pady=8, padx=8)
+        self.youtube_url = ttk.Entry(panel, width=60)
+        self.youtube_url.grid(row=0, column=1, columnspan=2, pady=8, padx=8)
+        
+        # Output path
+        ttk.Label(panel, text="Output Path:").grid(row=1, column=0, sticky=tk.W, pady=8, padx=8)
+        self.youtube_output = ttk.Entry(panel, width=50)
+        self.youtube_output.grid(row=1, column=1, pady=8, padx=8)
+        ttk.Button(panel, text="Browse", command=self.browse_youtube_output).grid(row=1, column=2, pady=8, padx=8)
+        
+        # Quality selection
+        ttk.Label(panel, text="Quality").grid(row=2, column=0, sticky=tk.W, pady=8, padx=8)
+        self.youtube_quality = ttk.Combobox(panel, values=["144", "240", "360", "480", "720", "1080"], width=10)
+        self.youtube_quality.current(4)
+        self.youtube_quality.grid(row=2, column=1, sticky=tk.W, pady=8, padx=8)
+        
+        # MP3 conversion option
+        self.youtube_mp3 = tk.BooleanVar()
+        ttk.Checkbutton(panel, text="Convert to MP3", variable=self.youtube_mp3).grid(
+            row=3, column=1, sticky=tk.W, pady=8, padx=8
+        )
+        
+        # Download button
+        self.youtube_download_btn = ttk.Button(
+            panel,
+            text="Start YouTube Download",
+            command=self.start_youtube_download
+        )
+        self.youtube_download_btn.grid(row=4, column=0, columnspan=3, pady=(15, 5))
+        
+        # Progress bar
+        self.youtube_progress = ttk.Progressbar(panel, mode='determinate')
+        self.youtube_progress.grid(row=6, column=0, columnspan=3, sticky=tk.EW, padx=8, pady=8)
+
+    def _create_spotify_panel(self):
+        """Create the Spotify download panel."""
+        panel = self.panels["spotify"]
+        
+        # Clear existing widgets
+        for widget in panel.winfo_children():
+            widget.destroy()
+            
+        panel.pack(fill=tk.BOTH, expand=True)
+        
+        # URL input
+        ttk.Label(panel, text="Spotify URL:").grid(row=0, column=0, sticky=tk.W, pady=8, padx=8)
+        self.spotify_url = ttk.Entry(panel, width=60)
+        self.spotify_url.grid(row=0, column=1, columnspan=2, pady=8, padx=8)
+        
+        # Output path
+        ttk.Label(panel, text="Output Path:").grid(row=1, column=0, sticky=tk.W, pady=8, padx=8)
+        self.spotify_output = ttk.Entry(panel, width=50)
+        self.spotify_output.grid(row=1, column=1, pady=8, padx=8)
+        ttk.Button(panel, text="Browse", command=self.browse_spotify_output).grid(row=1, column=2, pady=8, padx=8)
+        
+        # Download button
+        self.spotify_download_btn = ttk.Button(
+            panel,
+            text="Start Spotify Download",
+            command=self.start_spotify_download
+        )
+        self.spotify_download_btn.grid(row=2, column=0, columnspan=3, pady=(15, 5))
+        
+        # Progress bar
+        self.spotify_progress = ttk.Progressbar(panel, mode='determinate')
+        self.spotify_progress.grid(row=4, column=0, columnspan=3, sticky=tk.EW, padx=8, pady=8)
+
+    def show_youtube_panel(self):
+        """Switch to YouTube panel."""
+        self.panels["spotify"].pack_forget()
+        self.panels["youtube"].pack(fill=tk.BOTH, expand=True)
+        self.youtube_btn.state(["disabled"])
+        self.spotify_btn.state(["!disabled"])
+
+    def show_spotify_panel(self):
+        """Switch to Spotify panel."""
+        self.panels["youtube"].pack_forget()
+        self.panels["spotify"].pack(fill=tk.BOTH, expand=True)
+        self.spotify_btn.state(["disabled"])
+        self.youtube_btn.state(["!disabled"])
+        
+        # Reset playlist view
+        self.playlist_listbox.delete(0, tk.END)
+        self.playlist_percentage.config(text="0% downloaded")
+        self.last_spotify_index = 0
+
+    def browse_youtube_output(self):
+        """Open file dialog for YouTube output directory selection."""
+        if path := filedialog.askdirectory():
+            self.youtube_output.delete(0, tk.END)
+            self.youtube_output.insert(0, path)
+
+    def browse_spotify_output(self):
+        """Open file dialog for Spotify output directory selection."""
+        if path := filedialog.askdirectory():
+            self.spotify_output.delete(0, tk.END)
+            self.spotify_output.insert(0, path)
+
+    def preview_playlist(self):
+        """Preview Spotify playlist in the sidebar."""
+        url = self.spotify_url.get().strip()
+        if not url.startswith("https://open.spotify.com/"):
+            return
+            
+        threading.Thread(
+            target=self._preview_playlist_thread,
+            args=(url,),
+            daemon=True
+        ).start()
+
+    def _preview_playlist_thread(self, url):
+        """Background thread for playlist preview."""
+        sp_client = DownloadManager.initialize_spotify()
+        if sp_client is None:
+            self.root.after(0, lambda: messagebox.showerror("Error", "Spotify initialization failed"))
+            return
+            
+        if not (tracks := DownloadManager.get_spotify_tracks(sp_client, url)):
+            self.root.after(0, lambda: messagebox.showerror("Error", "No tracks found"))
+            return
+            
+        self.update_playlist_view(tracks)
+
+    def update_playlist_view(self, tracks: list):
+        """Update the playlist sidebar with track information."""
+        self.playlist_listbox.delete(0, tk.END)
+        self.tracks = tracks
+        
+        for i, track in enumerate(tracks, start=1):
+            display_text = f"{i}. {track['name']} - {track['artist']} ({track['album']})"
+            self.playlist_listbox.insert(tk.END, display_text)
+            self.playlist_listbox.itemconfig(i-1, foreground=COLOR_TEXT)
+
+    def toggle_download(self):
+        """Toggle between stopping and continuing downloads."""
+        if self.stop_btn["text"] == "Stop":
+            DownloadManager.set_stop()
+            self.stop_requested = True
+            self.stop_btn.config(text="Continue")
+            logging.info("Download paused by user.")
+            self._update_progress(0, "youtube")
+            self._update_progress(0, "spotify")
+            self.playlist_percentage.config(text="Download paused")
+        else:
+            self.stop_btn.config(text="Stop")
+            self.stop_requested = False
+            DownloadManager.reset_stop()
+            logging.info("Resuming download...")
+            self.resume_download()
+
+    def resume_download(self):
+        """Resume previously paused download."""
+        if self.last_download_type == "youtube":
+            params = self.last_youtube_params
+            threading.Thread(
+                target=self._youtube_download_thread,
+                args=(params["url"], params["output_path"], params["quality"], params["is_mp3"]),
+                daemon=True
+            ).start()
+        elif self.last_download_type == "spotify":
+            params = self.last_spotify_params
+            threading.Thread(
+                target=self._spotify_download_thread,
+                args=(params["url"], params["output_path"]),
+                daemon=True
+            ).start()
+
+    def start_youtube_download(self):
+        """Start YouTube download process."""
+        self.stop_requested = False
+        DownloadManager.reset_stop()
+        
+        url = self.youtube_url.get().strip()
+        output_path = self.youtube_output.get().strip()
+        quality = self.youtube_quality.get().strip()
+        is_mp3 = self.youtube_mp3.get()
+        
+        if not DownloadManager.is_valid_youtube_url(url):
+            messagebox.showerror("Error", "Invalid YouTube URL")
+            return
+            
+        self.last_download_type = "youtube"
+        self.last_youtube_params = {
+            "url": url,
+            "output_path": output_path,
+            "quality": quality,
+            "is_mp3": is_mp3
+        }
+        
+        threading.Thread(
+            target=self._youtube_download_thread,
+            args=(url, output_path, quality, is_mp3),
+            daemon=True
+        ).start()
+
+    def _youtube_download_thread(self, url, output_path, quality, is_mp3):
+        """Background thread for YouTube downloads."""
+        self.youtube_download_btn.config(state=tk.DISABLED)
+        try:
+            DownloadManager.download_youtube(url, output_path, is_mp3, quality)
+            self._update_progress(100, "youtube")
+            logging.info("YouTube download completed successfully")
+        except Exception as e:
+            logging.error(f"YouTube download failed: {str(e)}")
+            self._show_error("YouTube download failed or was paused")
+        finally:
+            self.youtube_download_btn.config(state=tk.NORMAL)
+            self.stop_requested = False
+            DownloadManager.reset_stop()
+            self.root.after(0, lambda: self.stop_btn.config(text="Stop"))
+
+    def start_spotify_download(self):
+        """Start Spotify download process."""
+        self.stop_requested = False
+        DownloadManager.reset_stop()
+        
+        url = self.spotify_url.get().strip()
+        output_path = self.spotify_output.get().strip()
+        
+        if not url.startswith("https://open.spotify.com/"):
+            messagebox.showerror("Error", "Invalid Spotify URL")
+            return
+            
+        self.last_download_type = "spotify"
+        self.last_spotify_params = {
+            "url": url,
+            "output_path": output_path
+        }
+        
+        self.preview_playlist()
+        self.last_spotify_index = 0
+        
+        threading.Thread(
+            target=self._spotify_download_thread,
+            args=(url, output_path),
+            daemon=True
+        ).start()
+
+    def _spotify_download_thread(self, url, output_path):
+        """Background thread for Spotify downloads."""
+        self.spotify_download_btn.config(state=tk.DISABLED)
+        try:
+            sp_client = DownloadManager.initialize_spotify()
+            if sp_client is None:
+                raise ValueError("Spotify initialization failed")
+                
+            if not (tracks := DownloadManager.get_spotify_tracks(sp_client, url)):
+                raise ValueError("No tracks found")
+                
+            total = len(tracks)
+            self.root.after(0, lambda: self.update_playlist_view(tracks))
+            
+            def download_track(track, idx):
+                if self.stop_requested or DownloadManager.stop_flag:
+                    self.last_spotify_index = idx
+                    logging.info(f"Download paused at track {idx+1}")
+                    return
+                
+                query = f"{track['name']} {track['artist']} official audio"
+                logging.info(f"Downloading: {query}")
+                
+                try:
+                    DownloadManager.download_youtube(query, output_path, is_audio=True)
+                    
+                    # Update metadata for the latest downloaded file
+                    mp3_files = [f for f in os.listdir(output_path) if f.lower().endswith('.mp3')]
+                    if mp3_files:
+                        latest_mp3 = max(
+                            [os.path.join(output_path, f) for f in mp3_files],
+                            key=os.path.getmtime
+                        )
+                        DownloadManager.update_mp3_metadata(latest_mp3, track)
+                    
+                    self.root.after(0, lambda idx=idx: self.playlist_listbox.itemconfig(idx, foreground=COLOR_DONE))
+                    progress = (idx + 1) / total * 100
+                    self._update_progress(progress, "spotify")
+                    
+                except Exception as e:
+                    logging.error(f"Failed to download track: {str(e)}")
+                    return
+                
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [executor.submit(download_track, track, i) for i, track in enumerate(tracks)]
+                concurrent.futures.wait(futures)
+                
+            self.last_spotify_index = 0
+            logging.info("Spotify download completed successfully")
+            self._update_progress(100, "spotify")
+                
+        except Exception as e:
+            logging.error(f"Spotify download failed: {str(e)}")
+            self._show_error("Spotify download failed or was paused")
+            self._update_progress(0, "spotify")
+            
+        finally:
+            self.spotify_download_btn.config(state=tk.NORMAL)
+            self.stop_requested = False
+            DownloadManager.reset_stop()
+            self.root.after(0, lambda: self.stop_btn.config(text="Stop"))
+
+    def _update_progress(self, value: float, service: str):
+        """Update progress bars and labels."""
+        self.root.after(0, lambda: getattr(self, f"{service}_progress").config(value=value))
+        if service == "spotify":
+            self.root.after(0, lambda: self.playlist_percentage.config(text=f"{value:.1f}% downloaded"))
+
+    def _show_error(self, message: str):
+        """Show error message dialog."""
+        self.root.after(0, lambda: messagebox.showerror("Error", message))
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DownloaderApp(root)
+    root.mainloop()
