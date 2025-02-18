@@ -2,10 +2,10 @@
 """
 Dark Theme Media Downloader
 --------------------------
-A modern dark-themed GUI application for downloading media from YouTube and Spotify.
+A modern dark-themed GUI application for downloading media from YouTube, Spotify, and SoundCloud.
 Features:
 - Auto-installs missing dependencies and ffmpeg
-- Spotify integration with playlist preview
+- Multi-platform service integration (YouTube, Spotify, SoundCloud)
 - Download progress tracking with visual feedback
 - Resume/pause functionality
 - Metadata and cover art handling
@@ -27,6 +27,7 @@ from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC
 from mutagen.mp3 import MP3
 from tkinter import filedialog, messagebox, ttk
+from yt_dlp import YoutubeDL
 
 # =============================================================================
 # Constants & Theme Configuration
@@ -77,7 +78,7 @@ STYLE_CONFIG = {
             "thickness": 20
         }
     }
-}
+}   
 
 def install_missing_dependencies() -> None:
     """Install required Python packages and ffmpeg if missing."""
@@ -112,7 +113,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 install_missing_dependencies()
 
 from pytube import YouTube
-from yt_dlp import YoutubeDL
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 
@@ -149,7 +149,7 @@ class DownloadManager:
             logging.info(f"Downloading: {percent} at {speed} | ETA: {eta}")
 
     @staticmethod
-    def download_youtube(query: str, output_path: str, is_audio: bool = True, quality: str = None) -> str:
+    def download_youtube(query: str, output_path: str, is_audio: bool = True, quality: str = None) -> None:
         try:
             if DownloadManager.stop_flag:
                 raise Exception("Download stopped before start.")
@@ -185,13 +185,36 @@ class DownloadManager:
                 
                 if os.path.exists(expected_filename):
                     logging.info(f"File exists, skipping: {expected_filename}")
-                    return expected_filename
+                    return
                 
                 ydl.download([query])
-                return expected_filename
                 
         except Exception as e:
             logging.error(f"YouTube download failed: {str(e)}")
+            raise
+
+    @staticmethod
+    def download_soundcloud(url: str, output_path: str) -> None:
+        """Download track from SoundCloud URL."""
+        try:
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': os.path.join(output_path, '%(title)s.%(ext)s'),
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '320',
+                }],
+                'quiet': True,
+                'progress_hooks': [DownloadManager._download_progress_hook],
+                'continue': True
+            }
+
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+                
+        except Exception as e:
+            logging.error(f"SoundCloud download failed: {str(e)}")
             raise
 
     @staticmethod
@@ -296,7 +319,7 @@ class DownloaderApp:
     
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Dark Theme Media Downloader")
+        self.root.title("Download made by Arta")
         self.root.geometry("1100x750")
         self.root.configure(bg=COLOR_BG)
         
@@ -344,6 +367,9 @@ class DownloaderApp:
         
         self.spotify_btn = ttk.Button(nav_frame, text="Spotify", command=self.show_spotify_panel)
         self.spotify_btn.pack(side=tk.LEFT, padx=10)
+
+        self.soundcloud_btn = ttk.Button(nav_frame, text="SoundCloud", command=self.show_soundcloud_panel)
+        self.soundcloud_btn.pack(side=tk.LEFT, padx=10)
         
         self.stop_btn = ttk.Button(nav_frame, text="Stop", command=self.toggle_download)
         self.stop_btn.pack(side=tk.RIGHT, padx=10)
@@ -359,11 +385,13 @@ class DownloaderApp:
         # Create panels
         self.panels = {
             "youtube": ttk.Frame(self.panel_frame),
-            "spotify": ttk.Frame(self.panel_frame)
+            "spotify": ttk.Frame(self.panel_frame),
+            "soundcloud": ttk.Frame(self.panel_frame)
         }
         
         self._create_youtube_panel()
         self._create_spotify_panel()
+        self._create_soundcloud_panel()
         
         # Playlist section
         self.playlist_frame = ttk.Frame(content_frame, relief=tk.GROOVE, borderwidth=2)
@@ -473,24 +501,70 @@ class DownloaderApp:
         self.spotify_progress = ttk.Progressbar(panel, mode='determinate')
         self.spotify_progress.grid(row=4, column=0, columnspan=3, sticky=tk.EW, padx=8, pady=8)
 
+    def _create_soundcloud_panel(self):
+        """Create the SoundCloud download panel."""
+        panel = self.panels["soundcloud"]
+        
+        # Clear existing widgets
+        for widget in panel.winfo_children():
+            widget.destroy()
+            
+        panel.pack(fill=tk.BOTH, expand=True)
+        
+        # URL input
+        ttk.Label(panel, text="SoundCloud URL:").grid(row=0, column=0, sticky=tk.W, pady=8, padx=8)
+        self.soundcloud_url = ttk.Entry(panel, width=60)
+        self.soundcloud_url.grid(row=0, column=1, columnspan=2, pady=8, padx=8)
+        
+        # Output path
+        ttk.Label(panel, text="Output Path:").grid(row=1, column=0, sticky=tk.W, pady=8, padx=8)
+        self.soundcloud_output = ttk.Entry(panel, width=50)
+        self.soundcloud_output.grid(row=1, column=1, pady=8, padx=8)
+        ttk.Button(panel, text="Browse", command=self.browse_soundcloud_output).grid(row=1, column=2, pady=8, padx=8)
+        
+        # Download button
+        self.soundcloud_download_btn = ttk.Button(
+            panel,
+            text="Start SoundCloud Download",
+            command=self.start_soundcloud_download
+        )
+        self.soundcloud_download_btn.grid(row=2, column=0, columnspan=3, pady=(15, 5))
+        
+        # Progress bar
+        self.soundcloud_progress = ttk.Progressbar(panel, mode='determinate')
+        self.soundcloud_progress.grid(row=4, column=0, columnspan=3, sticky=tk.EW, padx=8, pady=8)
+
     def show_youtube_panel(self):
         """Switch to YouTube panel."""
         self.panels["spotify"].pack_forget()
+        self.panels["soundcloud"].pack_forget()
         self.panels["youtube"].pack(fill=tk.BOTH, expand=True)
         self.youtube_btn.state(["disabled"])
         self.spotify_btn.state(["!disabled"])
+        self.soundcloud_btn.state(["!disabled"])
 
     def show_spotify_panel(self):
         """Switch to Spotify panel."""
         self.panels["youtube"].pack_forget()
+        self.panels["soundcloud"].pack_forget()
         self.panels["spotify"].pack(fill=tk.BOTH, expand=True)
         self.spotify_btn.state(["disabled"])
         self.youtube_btn.state(["!disabled"])
+        self.soundcloud_btn.state(["!disabled"])
         
         # Reset playlist view
         self.playlist_listbox.delete(0, tk.END)
         self.playlist_percentage.config(text="0% downloaded")
         self.last_spotify_index = 0
+
+    def show_soundcloud_panel(self):
+        """Switch to SoundCloud panel."""
+        self.panels["youtube"].pack_forget()
+        self.panels["spotify"].pack_forget()
+        self.panels["soundcloud"].pack(fill=tk.BOTH, expand=True)
+        self.soundcloud_btn.state(["disabled"])
+        self.youtube_btn.state(["!disabled"])
+        self.spotify_btn.state(["!disabled"])
 
     def browse_youtube_output(self):
         """Open file dialog for YouTube output directory selection."""
@@ -503,6 +577,12 @@ class DownloaderApp:
         if path := filedialog.askdirectory():
             self.spotify_output.delete(0, tk.END)
             self.spotify_output.insert(0, path)
+
+    def browse_soundcloud_output(self):
+        """Open file dialog for SoundCloud output directory selection."""
+        if path := filedialog.askdirectory():
+            self.soundcloud_output.delete(0, tk.END)
+            self.soundcloud_output.insert(0, path)
 
     def preview_playlist(self):
         """Preview Spotify playlist in the sidebar."""
@@ -548,6 +628,7 @@ class DownloaderApp:
             logging.info("Download paused by user.")
             self._update_progress(0, "youtube")
             self._update_progress(0, "spotify")
+            self._update_progress(0, "soundcloud")
             self.playlist_percentage.config(text="Download paused")
         else:
             self.stop_btn.config(text="Stop")
@@ -569,6 +650,13 @@ class DownloaderApp:
             params = self.last_spotify_params
             threading.Thread(
                 target=self._spotify_download_thread,
+                args=(params["url"], params["output_path"]),
+                daemon=True
+            ).start()
+        elif self.last_download_type == "soundcloud":
+            params = self.last_soundcloud_params
+            threading.Thread(
+                target=self._soundcloud_download_thread,
                 args=(params["url"], params["output_path"]),
                 daemon=True
             ).start()
@@ -702,6 +790,46 @@ class DownloaderApp:
             
         finally:
             self.spotify_download_btn.config(state=tk.NORMAL)
+            self.stop_requested = False
+            DownloadManager.reset_stop()
+            self.root.after(0, lambda: self.stop_btn.config(text="Stop"))
+
+    def start_soundcloud_download(self):
+        """Start SoundCloud download process."""
+        self.stop_requested = False
+        DownloadManager.reset_stop()
+        
+        url = self.soundcloud_url.get().strip()
+        output_path = self.soundcloud_output.get().strip()
+        
+        if not url.startswith("https://soundcloud.com/"):
+            messagebox.showerror("Error", "Invalid SoundCloud URL")
+            return
+            
+        self.last_download_type = "soundcloud"
+        self.last_soundcloud_params = {
+            "url": url,
+            "output_path": output_path
+        }
+        
+        threading.Thread(
+            target=self._soundcloud_download_thread,
+            args=(url, output_path),
+            daemon=True
+        ).start()
+
+    def _soundcloud_download_thread(self, url, output_path):
+        """Background thread for SoundCloud downloads."""
+        self.soundcloud_download_btn.config(state=tk.DISABLED)
+        try:
+            DownloadManager.download_soundcloud(url, output_path)
+            self._update_progress(100, "soundcloud")
+            logging.info("SoundCloud download completed successfully")
+        except Exception as e:
+            logging.error(f"SoundCloud download failed: {str(e)}")
+            self._show_error("SoundCloud download failed or was paused")
+        finally:
+            self.soundcloud_download_btn.config(state=tk.NORMAL)
             self.stop_requested = False
             DownloadManager.reset_stop()
             self.root.after(0, lambda: self.stop_btn.config(text="Stop"))
